@@ -8,20 +8,30 @@ class FileSystemAnalyzer {
         'scan_paths' => []
     ];
     
-    public function __construct($config = []) {
+    private const STATUS_CRITICAL = 'CRITICAL';
+    private const STATUS_WARNING = 'WARNING';
+    private const STATUS_OK = 'OK';
+    
+    public function __construct(array $config = []) {
         $this->config = array_merge($this->config, $config);
         $this->setupDefaultPaths();
     }
     
-    private function setupDefaultPaths() {
+    private function setupDefaultPaths(): void {
         if (strtoupper(PHP_OS_FAMILY) === 'WINDOWS') {
-            $this->config['scan_paths'] = ['C:\\', 'D:\\', 'E:\\'];
+            $drives = [];
+            foreach (range('C', 'Z') as $drive) {
+                if (is_dir("{$drive}:\\")) {
+                    $drives[] = "{$drive}:\\";
+                }
+            }
+            $this->config['scan_paths'] = !empty($drives) ? $drives : ['C:\\'];
         } else {
             $this->config['scan_paths'] = ['/', '/home', '/var', '/tmp', '/usr', '/boot'];
         }
     }
     
-    public function getFileSystemInfo($path = '/') {
+    public function getFileSystemInfo(string $path = '/'): array {
         if (isset($this->cache[$path])) {
             return $this->cache[$path];
         }
@@ -72,16 +82,36 @@ class FileSystemAnalyzer {
         return $result;
     }
     
-    private function isValidPath($path) {
-        return file_exists($path) && is_readable($path) && is_dir($path);
+    public function clearCache(?string $path = null): void {
+        if ($path) {
+            unset($this->cache[$path]);
+        } else {
+            $this->cache = [];
+        }
     }
     
-    private function getFileSystemType($path) {
+    private function isValidPath(string $path): bool {
+        return file_exists($path) && is_readable($path);
+    }
+    
+    private function executeCommand(string $command, string $path): ?string {
+        $timeout = escapeshellarg((string)$this->config['timeout']);
+        $escapedPath = escapeshellarg($path);
+        
+        $fullCommand = sprintf('timeout %s %s %s 2>/dev/null', 
+            $timeout, 
+            $command, 
+            $escapedPath
+        );
+        
+        return shell_exec($fullCommand);
+    }
+    
+    private function getFileSystemType(string $path): string {
         $os = strtoupper(PHP_OS_FAMILY);
         
         if ($os === 'LINUX' || $os === 'FREEBSD' || $os === 'DARWIN') {
-            $command = "timeout {$this->config['timeout']} df -T " . escapeshellarg($path) . " 2>/dev/null";
-            $output = shell_exec($command);
+            $output = $this->executeCommand('df -T', $path);
             
             if ($output) {
                 $lines = explode("\n", trim($output));
@@ -91,13 +121,17 @@ class FileSystemAnalyzer {
                 }
             }
             
-            $command = "timeout {$this->config['timeout']} mount | grep " . escapeshellarg($path);
-            $output = shell_exec($command);
+            $output = $this->executeCommand('mount', $path);
             if ($output && preg_match('/type\s+(\S+)/', $output, $matches)) {
                 return $matches[1];
             }
+            
+            $output = $this->executeCommand('df -P', $path);
+            if ($output) {
+                return 'Unknown (df -T not supported)';
+            }
         } elseif ($os === 'WINDOWS') {
-            $drive = substr($path, 0, 2);
+            $drive = escapeshellarg(substr($path, 0, 2));
             $output = shell_exec("fsutil fsinfo volumeinfo $drive 2>nul");
             if ($output && preg_match('/File System Name\s*:\s*(\S+)/', $output, $matches)) {
                 return $matches[1];
@@ -107,50 +141,60 @@ class FileSystemAnalyzer {
         return 'Unknown';
     }
     
-    private function getMountPoint($path) {
+    private function getMountPoint(string $path): string {
         if (strtoupper(PHP_OS_FAMILY) === 'WINDOWS') {
-            return substr($path, 0, 2);
+            $realPath = realpath($path);
+            return $realPath ? substr($realPath, 0, 2) : substr($path, 0, 2);
         }
         
-        $command = "timeout {$this->config['timeout']} df " . escapeshellarg($path) . " 2>/dev/null | tail -1 | awk '{print \$6}'";
-        $output = shell_exec($command);
-        return $output ? trim($output) : $path;
+        $output = $this->executeCommand('df -P', $path);
+        if ($output) {
+            $lines = explode("\n", trim($output));
+            if (count($lines) >= 2) {
+                $parts = preg_split('/\s+/', $lines[1]);
+                return $parts[5] ?? $path;
+            }
+        }
+        
+        return $path;
     }
     
-    private function getInodeInfo($path) {
+    private function getInodeInfo(string $path): ?array {
         if (strtoupper(PHP_OS_FAMILY) === 'WINDOWS') {
-            return null;
+            return ['total' => 'N/A', 'used' => 'N/A', 'free' => 'N/A', 'usage_percent' => 'N/A'];
         }
         
-        $command = "timeout {$this->config['timeout']} df -i " . escapeshellarg($path) . " 2>/dev/null | tail -1";
-        $output = shell_exec($command);
+        $output = $this->executeCommand('df -i', $path);
         
         if ($output) {
-            $parts = preg_split('/\s+/', trim($output));
-            if (count($parts) >= 6) {
-                return [
-                    'total' => $parts[1] ?? 0,
-                    'used' => $parts[2] ?? 0,
-                    'free' => $parts[3] ?? 0,
-                    'usage_percent' => isset($parts[4]) ? rtrim($parts[4], '%') : 0
-                ];
+            $lines = explode("\n", trim($output));
+            if (count($lines) >= 2) {
+                $parts = preg_split('/\s+/', $lines[1]);
+                if (count($parts) >= 6) {
+                    return [
+                        'total' => $parts[1] ?? 0,
+                        'used' => $parts[2] ?? 0,
+                        'free' => $parts[3] ?? 0,
+                        'usage_percent' => isset($parts[4]) ? rtrim($parts[4], '%') : 0
+                    ];
+                }
             }
         }
         
         return null;
     }
     
-    private function getUsageStatus($usagePercent) {
+    private function getUsageStatus(float $usagePercent): string {
         if ($usagePercent >= $this->config['critical_threshold']) {
-            return 'CRITICAL';
+            return self::STATUS_CRITICAL;
         } elseif ($usagePercent >= $this->config['warning_threshold']) {
-            return 'WARNING';
+            return self::STATUS_WARNING;
         } else {
-            return 'OK';
+            return self::STATUS_OK;
         }
     }
     
-    public function getAllFileSystems() {
+    public function getAllFileSystems(): array {
         $results = [];
         foreach ($this->config['scan_paths'] as $path) {
             $results[$path] = $this->getFileSystemInfo($path);
@@ -158,7 +202,7 @@ class FileSystemAnalyzer {
         return $results;
     }
     
-    public function getUniqueMountPoints() {
+    public function getUniqueMountPoints(): array {
         $allInfo = $this->getAllFileSystems();
         $uniqueMounts = [];
         
@@ -171,19 +215,18 @@ class FileSystemAnalyzer {
         return $uniqueMounts;
     }
     
-    public function formatBytes($bytes, $precision = 2) {
-        $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-        
+    public function formatBytes(float $bytes, int $precision = 2): string {
         if ($bytes <= 0) return '0 B';
         
+        $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
         $base = log($bytes) / log(1024);
-        $pow = min(floor($base), count($units) - 1);
+        $pow = min((int)floor($base), count($units) - 1);
         $bytes /= pow(1024, $pow);
         
         return round($bytes, $precision) . ' ' . $units[$pow];
     }
     
-    public function generateTextReport() {
+    public function generateTextReport(): string {
         $uniqueMounts = $this->getUniqueMountPoints();
         $report = "";
         
@@ -200,7 +243,7 @@ class FileSystemAnalyzer {
         return $report;
     }
     
-    private function formatFileSystemInfo($info) {
+    private function formatFileSystemInfo(array $info): string {
         $output = "";
         
         if (isset($info['error'])) {
@@ -218,7 +261,8 @@ class FileSystemAnalyzer {
         
         if ($info['inodes']) {
             $inodes = $info['inodes'];
-            $output .= "Inodes: {$inodes['used']}/{$inodes['total']} ({$inodes['usage_percent']}% used)\n";
+            $inodePercent = is_numeric($inodes['usage_percent']) ? $inodes['usage_percent'] . '%' : $inodes['usage_percent'];
+            $output .= "Inodes: {$inodes['used']}/{$inodes['total']} ($inodePercent used)\n";
         }
         
         $barWidth = 40;
@@ -228,7 +272,7 @@ class FileSystemAnalyzer {
         return $output;
     }
     
-    private function generateSummaryTable($uniqueMounts) {
+    private function generateSummaryTable(array $uniqueMounts): string {
         $output = "SUMMARY TABLE (Unique Mount Points)\n";
         $output .= str_repeat("-", 110) . "\n";
         $output .= sprintf("%-12s %-10s %-12s %-12s %-12s %-8s %-10s %s\n", 
@@ -244,7 +288,7 @@ class FileSystemAnalyzer {
             $inodeInfo = "N/A";
             if ($info['inodes']) {
                 $inodes = $info['inodes'];
-                $inodeInfo = "{$inodes['usage_percent']}%";
+                $inodeInfo = is_numeric($inodes['usage_percent']) ? $inodes['usage_percent'] . '%' : $inodes['usage_percent'];
             }
             
             $output .= sprintf("%-12s %-10s %-12s %-12s %-12s %-8s %-10s %s\n",
@@ -263,7 +307,7 @@ class FileSystemAnalyzer {
         return $output;
     }
     
-    public function getSystemSummary() {
+    public function getSystemSummary(): array {
         $uniqueMounts = $this->getUniqueMountPoints();
         $totalSpace = 0;
         $totalUsed = 0;
@@ -275,8 +319,8 @@ class FileSystemAnalyzer {
                 $totalSpace += $info['total'];
                 $totalUsed += $info['used'];
                 
-                if ($info['status'] === 'CRITICAL') $criticalCount++;
-                if ($info['status'] === 'WARNING') $warningCount++;
+                if ($info['status'] === self::STATUS_CRITICAL) $criticalCount++;
+                if ($info['status'] === self::STATUS_WARNING) $warningCount++;
             }
         }
         
